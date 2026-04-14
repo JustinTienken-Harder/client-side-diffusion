@@ -31,8 +31,10 @@
             status.textContent = "Loading models...";
             ort.env.wasm.numThreads = 4;
 
+            const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
             let gpuAvailable = false;
-            if (navigator.gpu) {
+            if (!isMobile && navigator.gpu) {
                 try {
                     const adapter = await navigator.gpu.requestAdapter();
                     gpuAvailable = adapter !== null;
