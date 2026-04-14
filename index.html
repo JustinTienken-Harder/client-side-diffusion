@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SDXS Demo</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
+        input { width: 100%; padding: 10px; font-size: 16px; box-sizing: border-box; }
+        canvas { margin-top: 20px; width: 512px; height: 512px; border: 1px solid #ccc; }
+        #status { margin-top: 10px; color: #666; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <h2>SDXS Image Generator</h2>
+    <input type="text" id="prompt" placeholder="Type a prompt..." />
+    <div id="status">Loading models...</div>
+    <canvas id="canvas" width="512" height="512"></canvas>
+
+    <script type="module">
+        // --- Config ---
+        const SIGMA = 14.6489;
+        const C_IN = 1.0 / Math.sqrt(SIGMA ** 2 + 1);
+        const DEBOUNCE_MS = 1000;
+
+        // --- Load models ---
+        let unetSess, decoderSess, textEncoderSess;
+        const status = document.getElementById("status");
+
+        async function loadModels() {
+            status.textContent = "Loading models...";
+            ort.env.wasm.numThreads = 4;
+            [textEncoderSess, unetSess, decoderSess] = await Promise.all([
+                ort.InferenceSession.create("text_encoder_merged.onnx"),
+                ort.InferenceSession.create("unet.onnx"),
+                ort.InferenceSession.create("decoder.onnx"),
+            ]);
+            status.textContent = "Ready — type a prompt!";
+        }
+
+        // --- Tokenizer (Transformers.js) ---
+        // NOTE: swap this out for your actual tokenizer if needed
+        // For now we use Transformers.js CLIP tokenizer
+        import { AutoTokenizer } from "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.1";
+        const tokenizer = await AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32");
+
+        // --- Inference ---
+        async function generate(prompt) {
+            status.textContent = "Generating...";
+            try {
+                // Tokenize
+                const encoded = await tokenizer(prompt, {
+                    padding: "max_length",
+                    truncation: true,
+                    max_length: 77,
+                    return_tensors: "pt"
+                });
+                const inputIds = new ort.Tensor("int64", BigInt64Array.from(
+                    Array.from(encoded.input_ids.data).map(BigInt)
+                ), [1, 77]);
+
+                // Text encoder
+                const textOut = await textEncoderSess.run({ input_ids: inputIds });
+                const promptEmbeds = textOut.last_hidden_state;
+
+                // Random latents
+                const latentData = new Float32Array(1 * 4 * 64 * 64)
+                    .map(() => randn() * SIGMA);
+                const modelInputData = latentData.map(x => x * C_IN);
+
+                const latentTensor = new ort.Tensor("float32", modelInputData, [1, 4, 64, 64]);
+                const timestep = new ort.Tensor("int64", BigInt64Array.from([999n]), [1]);
+
+                // UNet
+                const unetOut = await unetSess.run({
+                    sample: latentTensor,
+                    timestep,
+                    encoder_hidden_states: promptEmbeds
+                });
+                const noisePred = unetOut.output.data;
+
+                // Denoise: x0 = latents - sigma * noise_pred
+                const denoised = latentData.map((x, i) => x - SIGMA * noisePred[i]);
+                const denoisedTensor = new ort.Tensor("float32", denoised, [1, 4, 64, 64]);
+
+                // Decoder
+                const decOut = await decoderSess.run({ latents: denoisedTensor });
+                const imageTensor = decOut.image.data;
+
+                // Render to canvas
+                renderToCanvas(imageTensor);
+                status.textContent = `Done — "${prompt}"`;
+            } catch (e) {
+                status.textContent = `Error: ${e.message}`;
+                console.error(e);
+            }
+        }
+
+        function renderToCanvas(data) {
+            const canvas = document.getElementById("canvas");
+            const ctx = canvas.getContext("2d");
+            const imageData = ctx.createImageData(512, 512);
+            for (let i = 0; i < 512 * 512; i++) {
+                const r = data[i];                    // channel 0
+                const g = data[512 * 512 + i];        // channel 1
+                const b = data[2 * 512 * 512 + i];    // channel 2
+                imageData.data[i * 4 + 0] = Math.min(255, Math.max(0, ((r / 2 + 0.5) * 255)));
+                imageData.data[i * 4 + 1] = Math.min(255, Math.max(0, ((g / 2 + 0.5) * 255)));
+                imageData.data[i * 4 + 2] = Math.min(255, Math.max(0, ((b / 2 + 0.5) * 255)));
+                imageData.data[i * 4 + 3] = 255;
+            }
+            ctx.putImageData(imageData, 0, 0);
+        }
+
+        // Box-Muller normal distribution
+        function randn() {
+            const u = 1 - Math.random();
+            const v = Math.random();
+            return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+        }
+
+        // --- Debounced input ---
+        let debounceTimer;
+        document.getElementById("prompt").addEventListener("input", (e) => {
+            clearTimeout(debounceTimer);
+            const prompt = e.target.value.trim();
+            if (!prompt) return;
+            status.textContent = "Waiting...";
+            debounceTimer = setTimeout(() => generate(prompt), DEBOUNCE_MS);
+        });
+
+        await loadModels();
+    </script>
+</body>
+</html>
