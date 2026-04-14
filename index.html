@@ -21,7 +21,7 @@
         // --- Config ---
         const SIGMA = 14.6489;
         const C_IN = 1.0 / Math.sqrt(SIGMA ** 2 + 1);
-        const DEBOUNCE_MS = 1000;
+        const DEBOUNCE_MS = 500;
 
         // --- Load models ---
         let unetSess, decoderSess, textEncoderSess;
@@ -30,12 +30,20 @@
         async function loadModels() {
             status.textContent = "Loading models...";
             ort.env.wasm.numThreads = 4;
+
+            const gpuAvailable = navigator.gpu !== undefined;
+            const sessionOptions = gpuAvailable
+                ? { executionProviders: ["webgpu"] }
+                : { executionProviders: ["wasm"] };
+
+            status.textContent = `Loading models (${gpuAvailable ? "WebGPU" : "WASM"})...`;
+
             [textEncoderSess, unetSess, decoderSess] = await Promise.all([
-                ort.InferenceSession.create("text_encoder_merged.onnx"),
-                ort.InferenceSession.create("unet.onnx"),
-                ort.InferenceSession.create("decoder.onnx"),
+                ort.InferenceSession.create("https://huggingface.co/PhonemePanda/sdxs-onnx/resolve/main/text_encoder_merged.onnx", sessionOptions),
+                ort.InferenceSession.create("https://huggingface.co/PhonemePanda/sdxs-onnx/resolve/main/unet.onnx", sessionOptions),
+                ort.InferenceSession.create("https://huggingface.co/PhonemePanda/sdxs-onnx/resolve/main/decoder.onnx", sessionOptions),
             ]);
-            status.textContent = "Ready — type a prompt!";
+            status.textContent = `Ready — type a prompt! (${gpuAvailable ? "WebGPU" : "WASM"})`;
         }
 
         // --- Tokenizer (Transformers.js) ---
