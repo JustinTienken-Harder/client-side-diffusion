@@ -13,7 +13,7 @@
 </head>
 <body>
     <h2>SDXS Image Generator</h2>
-    <input type="text" id="prompt" placeholder="Type a prompt..." />
+    <input type="text" id="prompt" placeholder="Type a prompt..." disabled />
     <div id="status">Loading models...</div>
     <canvas id="canvas" width="512" height="512"></canvas>
 
@@ -44,6 +44,7 @@
                 ort.InferenceSession.create("https://huggingface.co/PhonemePanda/sdxs-onnx/resolve/main/decoder.onnx", sessionOptions),
             ]);
             status.textContent = `Ready — type a prompt! (${gpuAvailable ? "WebGPU" : "WASM"})`;
+            document.getElementById("prompt").disabled = false;
         }
 
         // --- Tokenizer (Transformers.js) ---
