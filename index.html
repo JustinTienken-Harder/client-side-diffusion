@@ -31,7 +31,16 @@
             status.textContent = "Loading models...";
             ort.env.wasm.numThreads = 4;
 
-            const gpuAvailable = navigator.gpu !== undefined;
+            let gpuAvailable = false;
+            if (navigator.gpu) {
+                try {
+                    const adapter = await navigator.gpu.requestAdapter();
+                    gpuAvailable = adapter !== null;
+                } catch (e) {
+                    gpuAvailable = false;
+                }
+            }
+
             const sessionOptions = gpuAvailable
                 ? { executionProviders: ["webgpu"] }
                 : { executionProviders: ["wasm"] };
