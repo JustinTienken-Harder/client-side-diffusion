@@ -2,45 +2,364 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>SDXS Demo</title>
+    <title>SDXS Latent Explorer</title>
     <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
     <style>
         body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
-        input { width: 100%; padding: 10px; font-size: 16px; box-sizing: border-box; }
-        canvas { margin-top: 20px; width: 512px; height: 512px; border: 1px solid #ccc; }
+        .inputs { display: flex; gap: 10px; margin-bottom: 10px; }
+        .inputs input { flex: 1; padding: 10px; font-size: 16px; box-sizing: border-box; }
+        .inputs label { font-size: 12px; color: #666; display: block; margin-bottom: 4px; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+        .description { display: flex; gap: 10px; margin-bottom: 10px; }
+        canvas { width: 100%; aspect-ratio: 1; border: 1px solid #ccc; cursor: crosshair; display: block; }
         #status { margin-top: 10px; color: #666; font-size: 14px; }
+        #axis-labels { margin-top: 4px; font-size: 11px; color: #999; }
+        #snap-wrap { margin: 8px 0; font-size: 14px; display: flex; align-items: center; gap: 6px; }
     </style>
 </head>
 <body>
-    <h2>SDXS Image Generator</h2>
-    <input type="text" id="prompt" placeholder="Type a prompt..." disabled />
+    <h2>SDXS Latent Explorer</h2>
+    <div class="inputs">
+        <div>
+            <label>X Axis Prompt</label>
+            <input type="text" id="prompt1" value="Brutalist Concrete Architecture" disabled />
+        </div>
+        <div>
+            <label>Y Axis Prompt</label>
+            <input type="text" id="prompt2" value="A Shimmering Deep-Space Nebula" disabled />
+        </div>
+    </div>
+    <div style="display: flex; align-items: center; gap: 16px; margin-bottom: 10px;">
+        <button id="encode-btn" disabled>Encode Prompts</button>
+        <div id="snap-wrap" style="margin: 0; display: flex; align-items: center; gap: 6px;">
+            <input type="checkbox" id="snap-toggle" />
+            <label for="snap-toggle">Snap to nearest line</label>
+        </div>
+    </div>
     <div id="status">Loading models...</div>
-    <canvas id="canvas" width="512" height="512"></canvas>
 
+    <div class="grid">
+        <div>
+            <canvas id="selector" width="512" height="512"></canvas>
+            <div id="axis-labels">
+                <div>↑ Y (0 to 1)</div>
+                <div>→ X (0 to 1)</div>
+            </div>
+        </div>
+        <canvas id="output" width="512" height="512"></canvas>
+    </div>
+    <div class="description">
+        <div>
+            <strong>Selector</strong><br/>
+            Click or drag to blend between the two prompts. Check "Snap to nearest line" to snap to the closest of: quarter circle, simplex line, or SLERP curve.
+        </div>
+        <div>
+            <strong>Output</strong><br/>
+            The image generated from the blended prompt at the selected point.
+        </div>
+    </div>
+    <div id="line-descriptions" style="font-size: 13px; color: #1b1b1b; margin-bottom: 10px;">
+        <div><strong style="color: #3e4a89;">Quarter Circle</strong>: Blends prompts with equal L2 norm of X and Y, ideal for when your prompt embeddings are orthogonal, otherwise the interpolation may be 20% extra "Cat" + "Dog".</div>
+        <div><strong style="color: #1f9e89;">SLERP Curve</strong>: Blends prompts by spherical interpolation, preserves magnitude of mixed prompts in embedding space. Because CLIP embeddings of a prompt are normalized (on the unit sphere), the "optimal" point in between also lies on this sphere.</div>
+        <div><strong style="color: #b4de2c;">Simplex Line</strong>: Blends prompts with x+y=1, i.e. fixed total weight. If prompts are highly parallel, then the SLERP approaches the simplex line.</div>
+    </div>
+    <div id="fun-notes" style="font-size: 13px; color: #1b1b1b;">
+        <div>This selection tool is just a fun way to explore the latent space of SDXS (a pseudo-acronym), a one-step latent diffusion model, through interpolation of the embeddings. 
+            Here are some interpretations/facts/etc: </div>
+        <div>- The 75% to 25% lines are the proportional blendings between Y and X.</div>
+        <div>- The text embeddings are quite "conical", and so they tend to point in the same direction. This means points near 0 (or negative) are generic no matter the prompts</div>
+        <div>- Hold your arms straight out and point at a 90 degree angle. Your hands are glued to a bendy hula hoop with the center at your chest.</div>
+        <div>- Picking two different prompts is like pointing in two random directions.</div>
+        <div>- The SLERP curve would be your fingertip if you swept your right arm to your left.</div>
+        <div>- The simplex line is a maximally taught string between your fingertips.</div>
+        <div>- The quarter circle is the bendy hula hoop's outer arc between your arms.</div>
+    </div>
     <script type="module">
-        // --- Config ---
         const SIGMA = 14.6489;
         const C_IN = 1.0 / Math.sqrt(SIGMA ** 2 + 1);
-        const DEBOUNCE_MS = 500;
+        const DEBOUNCE_MS = 300;
+
+        // Ensure button is disabled immediately before any async work
+        document.getElementById("encode-btn").disabled = true;
+
+        let unetSess, decoderSess, textEncoderSess;
+        let embeds1 = null, embeds2 = null;
+        let slerpOmega = null;
+        let selectedX = null, selectedY = null;
+        let debounceTimer;
+
+        const status = document.getElementById("status");
+        const selectorCanvas = document.getElementById("selector");
+        const selectorCtx = selectorCanvas.getContext("2d");
+
+        // --- Compute SLERP omega from two embeddings ---
+        function computeOmega(e1, e2) {
+            let dot = 0, n1 = 0, n2 = 0;
+            for (let i = 0; i < e1.length; i++) {
+                dot += e1[i] * e2[i];
+                n1 += e1[i] * e1[i];
+                n2 += e2[i] * e2[i];
+            }
+            n1 = Math.sqrt(n1);
+            n2 = Math.sqrt(n2);
+            const cosOmega = Math.min(1, Math.max(-1, dot / (n1 * n2)));
+            return Math.acos(cosOmega);
+        }
+
+        // --- Snap helpers ---
+
+        // Closest point on quarter circle arc x^2 + y^2 = 1, x in [0,1], y in [0,1]
+        function snapToQuarterCircle(x, y) {
+            const len = Math.sqrt(x * x + y * y);
+            if (len < 1e-9) return { x: Math.SQRT1_2, y: Math.SQRT1_2 };
+            return { x: x / len, y: y / len };
+        }
+
+        // Closest point on simplex line x + y = 1, x in [0,1], y in [0,1]
+        function snapToSimplex(x, y) {
+            // Project onto x + y = 1: t = (x + y - 1) / 2
+            const t = (x + y - 1) / 2;
+            const sx = Math.min(1, Math.max(0, x - t));
+            const sy = Math.min(1, Math.max(0, y - t));
+            return { x: sx, y: sy };
+        }
+
+        // Closest point on SLERP curve (sampled)
+        function snapToSlerp(x, y, omega) {
+            const sinOmega = Math.sin(omega);
+            const steps = 500;
+            let bestDist = Infinity, bestSx = x, bestSy = y;
+            for (let i = 0; i <= steps; i++) {
+                const t = i / steps;
+                let sx, sy;
+                if (sinOmega < 1e-6) {
+                    sx = 1 - t; sy = t;
+                } else {
+                    sx = Math.sin((1 - t) * omega) / sinOmega;
+                    sy = Math.sin(t * omega) / sinOmega;
+                }
+                const d = (sx - x) ** 2 + (sy - y) ** 2;
+                if (d < bestDist) { bestDist = d; bestSx = sx; bestSy = sy; }
+            }
+            return { x: bestSx, y: bestSy };
+        }
+
+        function dist2(ax, ay, bx, by) {
+            return (ax - bx) ** 2 + (ay - by) ** 2;
+        }
+
+        function snapToNearest(x, y) {
+            const qc = snapToQuarterCircle(x, y);
+            const si = snapToSimplex(x, y);
+            const candidates = [
+                { p: qc, d: dist2(x, y, qc.x, qc.y) },
+                { p: si, d: dist2(x, y, si.x, si.y) },
+            ];
+            if (slerpOmega !== null) {
+                const sl = snapToSlerp(x, y, slerpOmega);
+                candidates.push({ p: sl, d: dist2(x, y, sl.x, sl.y) });
+            }
+            candidates.sort((a, b) => a.d - b.d);
+            return candidates[0].p;
+        }
+
+        // --- Draw selector ---
+        function drawSelector(x, y) {
+            const w = selectorCanvas.width;
+            const h = selectorCanvas.height;
+
+            selectorCtx.clearRect(0, 0, w, h);
+
+            // Background
+            selectorCtx.fillStyle = "#f0f0f0";
+            selectorCtx.fillRect(0, 0, w, h);
+
+            // Grid lines 0.1 increments
+            selectorCtx.strokeStyle = "#ddd";
+            selectorCtx.lineWidth = 0.5;
+            selectorCtx.beginPath();
+            for (let i = 1; i < 10; i++) {
+                const gx = (i / 10) * w;
+                const gy = (i / 10) * h;
+                selectorCtx.moveTo(gx, 0); selectorCtx.lineTo(gx, h);
+                selectorCtx.moveTo(0, gy); selectorCtx.lineTo(w, gy);
+            }
+            selectorCtx.stroke();
+
+            // Axis labels
+            selectorCtx.fillStyle = "#000000";
+            selectorCtx.font = "12px sans-serif";
+            selectorCtx.textAlign = "left";
+            selectorCtx.fillText("0", 4, h - 4);
+            selectorCtx.textAlign = "right";
+            selectorCtx.fillText("1", w - 4, h - 4);
+            selectorCtx.textAlign = "left";
+            selectorCtx.fillText("1", 4, 12);
+
+            // Quarter circle guide
+            selectorCtx.strokeStyle = "#3e4a89";
+            selectorCtx.lineWidth = 1.5;
+            selectorCtx.beginPath();
+            selectorCtx.arc(0, h, w - 4, -Math.PI / 2, 0);
+            selectorCtx.stroke();
+
+            // Simplex line: x + y = 1
+            selectorCtx.strokeStyle = "#b4de2c";
+            selectorCtx.lineWidth = 1.5;
+            selectorCtx.beginPath();
+            selectorCtx.moveTo(w, h);
+            selectorCtx.lineTo(0, 0);
+            selectorCtx.stroke();
+
+            // Linear blend lines
+            const blend_colors = "#85846b";
+            selectorCtx.lineWidth = 1.5;
+            selectorCtx.setLineDash([4, 4]);
+            // y = x ~ 50% blend
+            selectorCtx.strokeStyle = blend_colors;
+            selectorCtx.beginPath();
+            selectorCtx.moveTo(0, h); selectorCtx.lineTo(w, 0);
+            selectorCtx.stroke();
+            // y = 0.333x ~ 25% blend
+            selectorCtx.beginPath();
+            selectorCtx.moveTo(0, h); selectorCtx.lineTo(w, h - 0.333 * w);
+            selectorCtx.stroke();
+            // y = 3x ~ 75% blend
+            selectorCtx.beginPath();
+            selectorCtx.moveTo(0, h);
+            const y3x = Math.min(h, 3 * w);
+            selectorCtx.lineTo(y3x / 3, h - y3x);
+            selectorCtx.stroke();
+            // y = 0.5x ~ 33% blend
+            selectorCtx.beginPath();
+            selectorCtx.moveTo(0, h); selectorCtx.lineTo(w, h - 0.5 * w);
+            selectorCtx.stroke();
+            // y = 2x ~ 66% blend
+            selectorCtx.beginPath();
+            selectorCtx.moveTo(0, h);
+            const y2x = Math.min(h, 2 * w);
+            selectorCtx.lineTo(y2x / 2, h - y2x);
+            selectorCtx.stroke();
+            selectorCtx.setLineDash([]);
+
+            // Linear blend line labels on right/top border
+            selectorCtx.fillStyle = "#000000";
+            selectorCtx.font = "11px sans-serif";
+
+            // Each entry: { slope: dy/dx from origin bottom-left, label }
+            // In canvas space: line goes from (0, h) with slope -slope
+            // Hits right edge (x=w) at y = h - slope*w, or top edge (y=0) at x = h/slope
+            const blendLines = [
+                { slope: 0.333, label: "25%" },
+                { slope: 0.5,   label: "33%" },
+                { slope: 1.0,   label: "50%" },
+                { slope: 2.0,   label: "66%" },
+                { slope: 3.0,   label: "75%" },
+            ];
+
+            for (const { slope, label } of blendLines) {
+                const yAtRightEdge = h - slope * w;
+                const xAtTopEdge = h / slope;
+                let lx, ly;
+                if (yAtRightEdge > 12) {
+                    // Hits right edge with enough room
+                    lx = w - 4;
+                    ly = yAtRightEdge;
+                    selectorCtx.textAlign = "right";
+                    selectorCtx.fillText(label, lx, ly - 3);
+                } else if (xAtTopEdge > 20 && xAtTopEdge < w - 20) {
+                    // Hits top edge with enough room
+                    selectorCtx.textAlign = "center";
+                    selectorCtx.fillText(label, xAtTopEdge, 12);
+                } else {
+                    // Corner case — nudge inward along the line
+                    const angle = Math.atan(slope);
+                    selectorCtx.textAlign = "left";
+                    selectorCtx.fillText(label, w - 40, 14);
+                }
+            }
+
+            // SLERP curve
+            if (slerpOmega !== null) {
+                const omega = slerpOmega;
+                const sinOmega = Math.sin(omega);
+                const invSinOmega = 1 / sinOmega;
+                selectorCtx.strokeStyle = "#1f9e89";
+                selectorCtx.lineWidth = 2;
+                selectorCtx.beginPath();
+                const steps = 200;
+                for (let i = 0; i <= steps; i++) {
+                    const t = i / steps;
+                    let sx, sy;
+                    if (sinOmega < 1e-6) {
+                        sx = 1 - t; sy = t;
+                    } else {
+                        sx = Math.sin((1 - t) * omega) * invSinOmega;
+                        sy = Math.sin(t * omega) * invSinOmega;
+                    }
+                    const px = sx * w;
+                    const py = (1 - sy) * h;
+                    if (i === 0) selectorCtx.moveTo(px, py);
+                    else selectorCtx.lineTo(px, py);
+                }
+                selectorCtx.stroke();
+            }
+
+            // Selection dot
+            if (x !== null && y !== null) {
+                const px = x * w;
+                const py = (1 - y) * h;
+                selectorCtx.fillStyle = "#440154";
+                selectorCtx.beginPath();
+                selectorCtx.arc(px, py, 8, 0, Math.PI * 2);
+                selectorCtx.fill();
+            }
+        }
+
+        drawSelector(null, null);
+
+        // --- Selector interaction ---
+        function handleSelectorClick(e) {
+            if (!embeds1 || !embeds2) return;
+            const rect = selectorCanvas.getBoundingClientRect();
+            const scaleX = selectorCanvas.width / rect.width;
+            const scaleY = selectorCanvas.height / rect.height;
+            const px = (e.clientX - rect.left) * scaleX;
+            const py = (e.clientY - rect.top) * scaleY;
+            let cx = Math.min(1, Math.max(0, px / selectorCanvas.width));
+            let cy = Math.min(1, Math.max(0, 1 - py / selectorCanvas.height));
+
+            if (document.getElementById("snap-toggle").checked) {
+                const snapped = snapToNearest(cx, cy);
+                cx = snapped.x;
+                cy = snapped.y;
+            }
+
+            selectedX = cx;
+            selectedY = cy;
+            drawSelector(selectedX, selectedY);
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => generate(selectedX, selectedY), DEBOUNCE_MS);
+        }
+
+        selectorCanvas.addEventListener("click", handleSelectorClick);
+        selectorCanvas.addEventListener("mousemove", (e) => {
+            if (e.buttons !== 1) return;
+            handleSelectorClick(e);
+        });
 
         // --- Load models ---
-        let unetSess, decoderSess, textEncoderSess;
-        const status = document.getElementById("status");
-
         async function loadModels() {
             status.textContent = "Loading models...";
             ort.env.wasm.numThreads = 4;
 
             const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-
             let gpuAvailable = false;
             if (!isMobile && navigator.gpu) {
                 try {
                     const adapter = await navigator.gpu.requestAdapter();
                     gpuAvailable = adapter !== null;
-                } catch (e) {
-                    gpuAvailable = false;
-                }
+                } catch (e) { gpuAvailable = false; }
             }
 
             const sessionOptions = gpuAvailable
@@ -54,62 +373,89 @@
                 ort.InferenceSession.create("https://huggingface.co/PhonemePanda/sdxs-onnx/resolve/main/unet.onnx", sessionOptions),
                 ort.InferenceSession.create("https://huggingface.co/PhonemePanda/sdxs-onnx/resolve/main/decoder.onnx", sessionOptions),
             ]);
-            status.textContent = `Ready — type a prompt! (${gpuAvailable ? "WebGPU" : "WASM"})`;
-            document.getElementById("prompt").disabled = false;
+
+            document.getElementById("prompt1").disabled = false;
+            document.getElementById("prompt2").disabled = false;
+            document.getElementById("encode-btn").disabled = false;
+            status.textContent = `Models loaded (${gpuAvailable ? "WebGPU" : "WASM"}) — encode prompts to begin!`;
         }
 
-        // --- Tokenizer (Transformers.js) ---
-        // NOTE: swap this out for your actual tokenizer if needed
-        // For now we use Transformers.js CLIP tokenizer
-        import { AutoTokenizer } from "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.1";
+        // --- Tokenizer ---
+        import { AutoTokenizer, env } from "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.1";
+        env.allowLocalModels = false;
+        env.remoteHost = "https://huggingface.co/";
+        env.remotePathTemplate = "{model}/resolve/main/";
         const tokenizer = await AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32");
 
-        // --- Inference ---
-        async function generate(prompt) {
-            status.textContent = "Generating...";
+        async function encodePrompt(text) {
+            const encoded = await tokenizer(text, {
+                padding: "max_length",
+                truncation: true,
+                max_length: 77,
+                return_tensors: "pt"
+            });
+            const inputIds = new ort.Tensor("int64", BigInt64Array.from(
+                Array.from(encoded.input_ids.data).map(BigInt)
+            ), [1, 77]);
+            const out = await textEncoderSess.run({ input_ids: inputIds });
+            return out.last_hidden_state.data;
+        }
+
+        let isEncoding = false;
+        document.getElementById("encode-btn").addEventListener("click", async () => {
+            if (isEncoding) return;
+            isEncoding = true;
+            status.textContent = "Encoding prompts...";
+            document.getElementById("encode-btn").disabled = true;
+            const p1 = document.getElementById("prompt1").value.trim();
+            const p2 = document.getElementById("prompt2").value.trim();
+            embeds1 = await encodePrompt(p1);
+            embeds2 = await encodePrompt(p2);
+
+            slerpOmega = computeOmega(embeds1, embeds2);
+            drawSelector(selectedX, selectedY);
+
+            document.getElementById("encode-btn").disabled = false;
+            isEncoding = false;
+            status.textContent = `Encoded! Ω=${slerpOmega.toFixed(4)} radians or θ = ${(slerpOmega * 180 / Math.PI).toFixed(2)}° — click the selector to generate!`;
+        });
+
+        // --- Generate ---
+        async function generate(x, y) {
+            if (!embeds1 || !embeds2) return;
+            status.textContent = `Generating (x=${x.toFixed(2)}, y=${y.toFixed(2)})...`;
             try {
-                // Tokenize
-                const encoded = await tokenizer(prompt, {
-                    padding: "max_length",
-                    truncation: true,
-                    max_length: 77,
-                    return_tensors: "pt"
-                });
-                const inputIds = new ort.Tensor("int64", BigInt64Array.from(
-                    Array.from(encoded.input_ids.data).map(BigInt)
-                ), [1, 77]);
-
-                // Text encoder
-                const textOut = await textEncoderSess.run({ input_ids: inputIds });
-                const promptEmbeds = textOut.last_hidden_state;
-
-                // Random latents
-                const latentData = new Float32Array(1 * 4 * 64 * 64)
-                    .map(() => randn() * SIGMA);
-                const modelInputData = latentData.map(x => x * C_IN);
-
-                const latentTensor = new ort.Tensor("float32", modelInputData, [1, 4, 64, 64]);
+                const blended = new Float32Array(embeds1.length);
+                for (let i = 0; i < blended.length; i++) {
+                    blended[i] = x * embeds1[i] + y * embeds2[i];
+                }
+                const promptEmbeds = new ort.Tensor("float32", blended, [1, 77, 768]);
+                const latentData = new Float32Array(1 * 4 * 64 * 64).map(() => randn() * SIGMA);
+                const latentTensor = new ort.Tensor("float32", latentData.map(v => v * C_IN), [1, 4, 64, 64]);
                 const timestep = new ort.Tensor("int64", BigInt64Array.from([999n]), [1]);
 
-                // UNet
                 const unetOut = await unetSess.run({
                     sample: latentTensor,
                     timestep,
                     encoder_hidden_states: promptEmbeds
                 });
-                const noisePred = unetOut.output.data;
+                promptEmbeds.dispose();
+                latentTensor.dispose();
+                timestep.dispose();
 
-                // Denoise: x0 = latents - sigma * noise_pred
-                const denoised = latentData.map((x, i) => x - SIGMA * noisePred[i]);
+                const noisePred = unetOut.output.data.slice();
+                unetOut.output.dispose();
+
+                const denoised = latentData.map((v, i) => v - SIGMA * noisePred[i]);
                 const denoisedTensor = new ort.Tensor("float32", denoised, [1, 4, 64, 64]);
-
-                // Decoder
                 const decOut = await decoderSess.run({ latents: denoisedTensor });
-                const imageTensor = decOut.image.data;
+                denoisedTensor.dispose();
 
-                // Render to canvas
-                renderToCanvas(imageTensor);
-                status.textContent = `Done — "${prompt}"`;
+                const imageData = decOut.image.data.slice();
+                decOut.image.dispose();
+
+                renderToCanvas(imageData);
+                status.textContent = `Done (x=${x.toFixed(2)}, y=${y.toFixed(2)})`;
             } catch (e) {
                 status.textContent = `Error: ${e.message}`;
                 console.error(e);
@@ -117,36 +463,28 @@
         }
 
         function renderToCanvas(data) {
-            const canvas = document.getElementById("canvas");
+            const canvas = document.getElementById("output");
             const ctx = canvas.getContext("2d");
             const imageData = ctx.createImageData(512, 512);
             for (let i = 0; i < 512 * 512; i++) {
-                const r = data[i];                    // channel 0
-                const g = data[512 * 512 + i];        // channel 1
-                const b = data[2 * 512 * 512 + i];    // channel 2
-                imageData.data[i * 4 + 0] = Math.min(255, Math.max(0, ((r / 2 + 0.5) * 255)));
-                imageData.data[i * 4 + 1] = Math.min(255, Math.max(0, ((g / 2 + 0.5) * 255)));
-                imageData.data[i * 4 + 2] = Math.min(255, Math.max(0, ((b / 2 + 0.5) * 255)));
+                imageData.data[i * 4 + 0] = Math.min(255, Math.max(0, (data[i] / 2 + 0.5) * 255));
+                imageData.data[i * 4 + 1] = Math.min(255, Math.max(0, (data[512 * 512 + i] / 2 + 0.5) * 255));
+                imageData.data[i * 4 + 2] = Math.min(255, Math.max(0, (data[2 * 512 * 512 + i] / 2 + 0.5) * 255));
                 imageData.data[i * 4 + 3] = 255;
             }
             ctx.putImageData(imageData, 0, 0);
         }
 
-        // Box-Muller normal distribution
         function randn() {
             const u = 1 - Math.random();
             const v = Math.random();
             return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
         }
 
-        // --- Debounced input ---
-        let debounceTimer;
-        document.getElementById("prompt").addEventListener("input", (e) => {
-            clearTimeout(debounceTimer);
-            const prompt = e.target.value.trim();
-            if (!prompt) return;
-            status.textContent = "Waiting...";
-            debounceTimer = setTimeout(() => generate(prompt), DEBOUNCE_MS);
+        window.addEventListener("beforeunload", () => {
+            unetSess?.release();
+            decoderSess?.release();
+            textEncoderSess?.release();
         });
 
         await loadModels();
